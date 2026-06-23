@@ -1,0 +1,30 @@
+*logs*
+*.csv
+*.log
+*.sh
+visualize_html.py
+debug*
+__pycache__
+*/__pycache__
+*/*/__pycache__
+*/*/*/__pycache__
+*.pyc
+*.txt
+*.egg-info
+*.ipynb
+*.out
+*.sbatch
+*.err
+*.png
+configs/deepseek*
+!assets/*.png
+src/realtimegym/environments/prompts
+
+# Environment variables (API keys)
+.env
+.env.local
+.env.*.local
+
+# Personal config files with API keys
+configs/*-personal.yaml
+configs/my-*.yaml

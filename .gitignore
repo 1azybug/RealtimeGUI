@@ -1,0 +1,22 @@
+# --- VM images & large artifacts (NEVER commit) ---
+Env/OSWorld/docker_vm_data/
+*.qcow2
+*.qcow2.zip
+
+# --- run outputs / generated artifacts ---
+results/
+results_*/
+**/results/
+**/logs_gui/
+*.log
+
+# --- python / caches ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+**/.cache/
+Env/OSWorld/cache/
+
+# --- os ---
+.DS_Store

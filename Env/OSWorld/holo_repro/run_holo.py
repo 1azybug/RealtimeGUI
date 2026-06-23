@@ -1,0 +1,215 @@
+"""Run the decoupled Holo agent on OSWorld-Verified (docker provider).
+
+Thin assembly layer — it owns NO agent logic and NO desktop logic:
+  * environment side  -> OSWorld ``DesktopEnv`` wrapped by ``OSWorldComputerEnv``
+  * agent side        -> ``holo_agent.HoloComputerAgent`` (installed package, untouched)
+
+For each task: reset the VM, wrap it as a ComputerEnv, let the agent run its
+official loop until it calls ``answer``, then translate that final answer into the
+OSWorld special action needed for scoring (DONE, or FAIL if the answer declares
+the task infeasible — same convention as mm_agents/surferH/surfer_agent.py) and
+call ``env.evaluate()``.
+
+Usage (run inside the `osworld` conda env, with Holo-3.1-4B served on :8002):
+  python holo_repro/run_holo.py --domain os --max_tasks 1            # smoke test
+  python holo_repro/run_holo.py                                      # full 369
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import sys
+import time
+
+# The OSWorld adapter sits next to this script; the agent (holo_agent) and the
+# contract (computer_env) are installed packages. We add this script's dir (for
+# osworld_computer_env) and the OSWorld repo root (for desktop_env) to sys.path,
+# so the runner works whether or not cwd is the OSWorld root.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.dirname(_HERE))  # OSWorld repo root (has desktop_env/)
+
+# localhost vLLM must bypass the clash proxy.
+os.environ.setdefault("no_proxy", "localhost,127.0.0.1")
+os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
+
+from openai import OpenAI  # noqa: E402
+
+from desktop_env.desktop_env import DesktopEnv  # noqa: E402
+from holo_agent import HoloComputerAgent, TrajectoryRecorder  # noqa: E402
+from holo_agent import report as holo_report  # noqa: E402
+from osworld_computer_env import OSWorldComputerEnv  # noqa: E402
+
+# Same infeasibility convention as the cloud agent (surferH/surfer_agent.py:53):
+# if the final answer declares the task infeasible, score via OSWorld's FAIL path.
+_INFEASIBLE_RE = re.compile(r"task.{0,4}infeasible|infeasible|cannot be (completed|done)|not possible", re.IGNORECASE)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("holo_repro")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", default="Holo-3.1-4B")
+    p.add_argument("--base_url", default="http://127.0.0.1:8002/v1")
+    p.add_argument("--api_key", default="EMPTY")
+    p.add_argument("--test_meta", default="evaluation_examples/test_all.json")
+    p.add_argument("--examples_dir", default="evaluation_examples/examples")
+    p.add_argument("--result_dir", default="results")
+    p.add_argument("--domain", default="all", help="single domain or 'all'")
+    p.add_argument("--example_id", default=None, help="run one specific example id")
+    p.add_argument("--max_tasks", type=int, default=0, help="0 = no limit")
+    p.add_argument("--max_steps", type=int, default=100)
+    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--reasoning_effort", default="medium")
+    p.add_argument("--image_budget", type=int, default=3)
+    p.add_argument("--pause", type=float, default=1.0, help="sleep after each action")
+    p.add_argument("--screen_width", type=int, default=1920)
+    p.add_argument("--screen_height", type=int, default=1080)
+    p.add_argument("--sleep_after_reset", type=float, default=60.0)
+    return p.parse_args()
+
+
+def select_tasks(args: argparse.Namespace) -> list[tuple[str, str]]:
+    with open(args.test_meta, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    tasks: list[tuple[str, str]] = []
+    domains = meta.keys() if args.domain == "all" else [args.domain]
+    for d in domains:
+        for ex in meta.get(d, []):
+            if args.example_id and ex != args.example_id:
+                continue
+            tasks.append((d, ex))
+    if args.max_tasks > 0:
+        tasks = tasks[: args.max_tasks]
+    return tasks
+
+
+def run_one(args, env, client, domain, example_id) -> float | None:
+    config_file = os.path.join(args.examples_dir, domain, f"{example_id}.json")
+    with open(config_file, "r", encoding="utf-8") as f:
+        example = json.load(f)
+    instruction = example["instruction"]
+
+    example_result_dir = os.path.join(
+        args.result_dir, "pyautogui", "screenshot", args.model, domain, example_id
+    )
+    os.makedirs(example_result_dir, exist_ok=True)
+
+    # Resume: skip already-scored tasks.
+    result_path = os.path.join(example_result_dir, "result.txt")
+    if os.path.exists(result_path):
+        with open(result_path) as f:
+            prev = f.read().strip()
+        logger.info("[skip] %s/%s already scored: %s", domain, example_id, prev)
+        try:
+            return float(prev)
+        except ValueError:
+            return None
+
+    logger.info("[task] %s/%s :: %s", domain, example_id, instruction)
+    env.reset(task_config=example)
+    time.sleep(args.sleep_after_reset)  # let the VM/app settle
+
+    cenv = OSWorldComputerEnv(env, instruction, pause=args.pause)
+    # Generic, env-agnostic recording lives in the Agent package and is shared by
+    # every runner: traj.jsonl + observation screenshots + the system prompt.
+    recorder = TrajectoryRecorder(example_result_dir)
+    agent = HoloComputerAgent(
+        client=client,
+        model=args.model,
+        env=cenv,
+        max_steps=args.max_steps,
+        temperature=args.temperature,
+        reasoning_effort=args.reasoning_effort,
+        image_budget=args.image_budget,
+        on_step=recorder.on_step,
+    )
+    recorder.dump_system_prompt(agent.system_prompt())
+
+    try:
+        env.controller.start_recording()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("start_recording failed: %s", e)
+
+    summary = agent.run()
+    answer = summary.get("answer")
+    logger.info("agent finished: %s answer=%r", summary, answer)
+
+    # Translate the agent's final answer into an OSWorld special action so the
+    # evaluator (esp. the 'infeasible' func) sees it in action_history. If the
+    # agent answered and the text declares infeasibility -> FAIL, else DONE.
+    if answer is not None:
+        if _INFEASIBLE_RE.search(answer):
+            logger.info("answer declares infeasible -> FAIL")
+            env.step("FAIL", args.pause)
+        else:
+            env.step("DONE", args.pause)
+
+    time.sleep(20)  # let the environment settle before evaluation
+    result = env.evaluate()
+    logger.info("[result] %s/%s = %.2f", domain, example_id, result)
+
+    with open(result_path, "w", encoding="utf-8") as f:
+        f.write(f"{result}\n")
+    try:
+        env.controller.end_recording(os.path.join(example_result_dir, "recording.mp4"))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("end_recording failed: %s", e)
+
+    # Render the self-contained HTML replay (observation + reticle + note/thought/action).
+    try:
+        with open(os.path.join(example_result_dir, "report.html"), "w", encoding="utf-8") as f:
+            f.write(holo_report.build_html(example_result_dir))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("report generation failed: %s", e)
+    return float(result)
+
+
+def main() -> None:
+    args = parse_args()
+    tasks = select_tasks(args)
+    logger.info("selected %d task(s)", len(tasks))
+
+    client = OpenAI(base_url=args.base_url, api_key=args.api_key)
+
+    env = DesktopEnv(
+        provider_name="docker",
+        path_to_vm=None,
+        action_space="pyautogui",
+        screen_size=(args.screen_width, args.screen_height),
+        headless=True,
+        os_type="Ubuntu",
+        require_a11y_tree=False,
+    )
+
+    scores: list[float] = []
+    try:
+        for domain, example_id in tasks:
+            try:
+                r = run_one(args, env, client, domain, example_id)
+                if r is not None:
+                    scores.append(r)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("task %s/%s crashed: %s", domain, example_id, e)
+    finally:
+        try:
+            env.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if scores:
+        logger.info("DONE. mean score over %d tasks = %.4f", len(scores), sum(scores) / len(scores))
+    else:
+        logger.info("DONE. no scores recorded.")
+
+
+if __name__ == "__main__":
+    main()

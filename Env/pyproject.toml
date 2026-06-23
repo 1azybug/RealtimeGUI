@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "computer-env"
+version = "0.1.0"
+description = "Generic computer-use environment interface (ComputerEnv / InputEvent / StepResult) — the Agent/Env decoupling boundary."
+requires-python = ">=3.10"
+dependencies = [
+    "pillow",
+]
+
+[tool.setuptools]
+packages = ["computer_env"]

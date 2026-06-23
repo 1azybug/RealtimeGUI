@@ -1,0 +1,217 @@
+"""Generic Holo3.1 computer-use agent loop (task-agnostic, environment-agnostic).
+
+Implements the official H Company agent loop (``Agent/docs/holo_official/
+agent-loop.md``) against the generic ``computer_env.ComputerEnv`` interface. This
+module contains NO environment-specific knowledge — it never names or branches
+on any particular environment. It drives any ``ComputerEnv`` by reading
+screenshots and emitting actions from its fixed Holo toolbox.
+
+Official conventions implemented here:
+  * Structured output: one ``{note, thought, tool_call}`` JSON per step,
+    constrained via ``extra_body.structured_outputs.json`` AND the same schema
+    embedded in the system prompt's ``<output_format>`` block.
+  * Reasoning on (``enable_thinking=True``), read from ``reasoning_content``,
+    never fed back into the conversation. Cross-turn memory rides in ``note``.
+  * Coordinates in [0,1000], scaled to pixels using the screenshot size.
+  * Image budget: keep only the last 3 screenshots; older ones become a text
+    placeholder while keeping the ``<observation>`` wrapper.
+  * Chat layout: assistant gets the parsed JSON; tool results come back as a
+    ``user`` message wrapped in ``<tool_output tool="...">``.
+  * Termination: the ``answer`` tool ends the loop; its content is the final
+    answer (infeasibility, if any, is conveyed in that text by convention).
+"""
+
+from __future__ import annotations
+
+import base64
+import time
+from io import BytesIO
+from typing import Any, Optional
+
+from openai import OpenAI
+from PIL import Image
+
+from computer_env import ComputerEnv, InputEvent
+from holo_agent.tools import TERMINAL_TOOLS, TOOLS, build_schema, make_step_model, parse_step, schema_block
+
+_SYSTEM_PROMPT = """You are an autonomous computer-use agent. You operate a computer the way a human does: you look at a screenshot of the screen and act by clicking with the mouse, typing on the keyboard, and pressing keys.
+
+Each step you receive the current screenshot inside an <observation> block. Decide the single best next action to make progress on the user's task, then respond with exactly ONE JSON object matching the schema below.
+
+Guidelines:
+- Look carefully at the screenshot. On-screen labels, controls, and text tell you what actions are available and what they do — infer the controls from what you see.
+- Coordinates are integers in [0, 1000], normalized to the screenshot (origin top-left). Aim at the center of the target element.
+- Put any information you must remember for later in the `note` field; your private reasoning is not carried across steps.
+- Take exactly one action per step, chosen from the tools available in the schema below.
+- When the task is fully complete (or if it is genuinely impossible), call `answer` with your final answer or a short summary.
+
+{schema_block}"""
+
+
+def _image_to_data_url(image: Image.Image) -> str:
+    buf = BytesIO()
+    image.convert("RGB").save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
+
+
+def trim_to_last_n_images(messages: list[dict[str, Any]], n: int = 3) -> None:
+    """Keep only the last ``n`` screenshots; evict older image chunks to text."""
+    seen = 0
+    for msg in reversed(messages):
+        if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
+            continue
+        for chunk in msg["content"]:
+            if chunk.get("type") != "image_url":
+                continue
+            seen += 1
+            if seen > n:
+                chunk["type"] = "text"
+                chunk["text"] = "[screenshot evicted]"
+                chunk.pop("image_url", None)
+
+
+class HoloComputerAgent:
+    """Drives any ComputerEnv via the official Holo structured-output loop."""
+
+    def __init__(
+        self,
+        client: OpenAI,
+        model: str,
+        env: ComputerEnv,
+        max_steps: int = 100,
+        temperature: float = 0.8,
+        reasoning_effort: str = "medium",
+        image_budget: int = 3,
+        max_tokens: int = 2048,
+        top_p: float = 0.9,
+        on_step: Optional[Any] = None,
+    ) -> None:
+        self.client = client
+        self.model = model
+        self.env = env
+        self.max_steps = max_steps
+        self.temperature = temperature
+        self.reasoning_effort = reasoning_effort
+        self.image_budget = image_budget
+        self.max_tokens = max_tokens
+        self.top_p = top_p
+        # Optional callback(step_index, screenshot, step_obj, info_dict, reasoning).
+        self.on_step = on_step
+        # The agent owns its action vocabulary — a single fixed Holo toolbox.
+        self.step_model = make_step_model(TOOLS)
+        self.schema = build_schema(self.step_model)
+
+    def _system_message(self) -> dict[str, Any]:
+        content = _SYSTEM_PROMPT.format(schema_block=schema_block(self.step_model))
+        content += f"\n\n<task>\n{self.env.task}\n</task>"
+        return {"role": "system", "content": content}
+
+    def system_prompt(self) -> str:
+        """The exact system prompt the model is given (instructions + output schema + task).
+
+        Public accessor for recording / inspection (see ``holo_agent.recorder``)."""
+        return self._system_message()["content"]
+
+    def _observation_message(self, image: Image.Image) -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<observation>\n"},
+                {"type": "image_url", "image_url": {"url": _image_to_data_url(image)}},
+                {"type": "text", "text": "\n</observation>"},
+            ],
+        }
+
+    def _call_model(self, messages: list[dict[str, Any]]) -> tuple[str, str]:
+        """Return (content, reasoning_content). Retries on transient errors."""
+        last_err = None
+        for attempt in range(4):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    max_tokens=self.max_tokens,
+                    reasoning_effort=self.reasoning_effort,
+                    extra_body={
+                        "structured_outputs": {"json": self.schema},
+                        "chat_template_kwargs": {"enable_thinking": True},
+                    },
+                )
+                msg = resp.choices[0].message
+                return (msg.content or ""), (getattr(msg, "reasoning_content", None) or "")
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                time.sleep(2.0 * (attempt + 1))
+        raise RuntimeError(f"model call failed after retries: {last_err}")
+
+    # Coordinate fields that must be scaled from [0,1000] to pixels.
+    _COORD_FIELDS = ("x", "y", "to_x", "to_y")
+
+    def _tool_call_to_event(self, tool_call: Any) -> InputEvent:
+        """Convert a parsed tool_call into a pixel-space InputEvent.
+
+        Any coordinate fields are scaled from the model's [0,1000] space to
+        pixels using the env's screen size; everything else passes through. The
+        agent does not know how the env executes — it just emits the event.
+        """
+        params = tool_call.model_dump()
+        name = params.pop("tool_name")
+        if any(f in params for f in self._COORD_FIELDS):
+            w, h = self.env.screen_size()
+            for f in ("x", "to_x"):
+                if params.get(f) is not None:
+                    params[f] = int(params[f] / 1000 * w)
+            for f in ("y", "to_y"):
+                if params.get(f) is not None:
+                    params[f] = int(params[f] / 1000 * h)
+        return InputEvent(tool_name=name, params=params)
+
+    def run(self) -> dict[str, Any]:
+        """Run until the env is done, the agent answers, or max_steps is hit."""
+        messages: list[dict[str, Any]] = [self._system_message()]
+        steps = 0
+        finished_by_agent = False
+        final_answer: Optional[str] = None
+
+        while not self.env.is_done() and steps < self.max_steps:
+            image = self.env.screenshot()
+            messages.append(self._observation_message(image))
+            trim_to_last_n_images(messages, self.image_budget)
+
+            content, reasoning = self._call_model(messages)
+            step = parse_step(content, self.step_model)
+            # Re-add ONLY the parsed output (never the reasoning).
+            messages.append({"role": "assistant", "content": step.model_dump_json()})
+
+            tc = step.tool_call
+            if tc.tool_name in TERMINAL_TOOLS:
+                finished_by_agent = True
+                final_answer = getattr(tc, "content", "")
+                if self.on_step:
+                    self.on_step(steps, image, step, {"done": True}, reasoning)
+                break
+
+            event = self._tool_call_to_event(tc)
+            result = self.env.step(event)
+
+            tool_output = result.info.get("tool_output", "") if isinstance(result.info, dict) else str(result.info)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f'<tool_output tool="{tc.tool_name}">\n{tool_output}\n</tool_output>',
+                }
+            )
+            if self.on_step:
+                self.on_step(steps, image, step, result.info, reasoning)
+            steps += 1
+            if result.done:
+                break
+
+        return {
+            "steps": steps,
+            "finished_by_agent": finished_by_agent,
+            "answer": final_answer,
+        }

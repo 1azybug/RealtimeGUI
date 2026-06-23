@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "holo-agent"
+version = "0.1.0"
+description = "Decoupled Holo3.1 computer-use agent (HoloComputerAgent) — drives any computer_env.ComputerEnv."
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40",
+    "pydantic>=2",
+    "pillow",
+]
+# NOTE: holo-agent also requires the local `computer-env` package (the Agent/Env
+# contract). It is a sibling editable install, NOT a PyPI package, so it is
+# intentionally not listed here to avoid the resolver fetching an unrelated
+# PyPI project of the same name. Install it explicitly: `pip install -e Env/`.
+
+[tool.setuptools]
+packages = ["holo_agent"]
