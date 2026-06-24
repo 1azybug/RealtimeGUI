@@ -21,14 +21,15 @@ CLASH       = http://127.0.0.1:7897
 ```bash
 DOCKER_HOST=unix:///var/run/docker.sock   # 系统 root docker（KVM 必需）
 OSWORLD_FORCE_KVM=1                        # 强制挂 /dev/kvm
-OSWORLD_HF_MIRROR=hf-mirror.com            # 全局把 huggingface.co→hf-mirror.com
-http_proxy=$CLASH  https_proxy=$CLASH      # HF 经 clash 出网
+http_proxy=$CLASH  https_proxy=$CLASH      # HF 经 clash 直连 huggingface.co 出网（大小文件都行）
 no_proxy=localhost,127.0.0.1               # vLLM/docker/VM 直连
+# 不要设 OSWORLD_HF_MIRROR！hf-mirror 把大文件(LFS)302→不可达的 cas-bridge.xethub.hf.co，大文件全失败。
+# run_holo 的"huggingface→mirror 全局补丁"由 OSWORLD_HF_MIRROR 开关控制，不设即关闭，请求直奔 huggingface.co 经 clash。
 ```
 
 ## 决策点（按现状选）
 - KVM：本机 rootless docker 用不了 KVM → **必须** `DOCKER_HOST=系统docker + OSWORLD_FORCE_KVM=1`。验证：容器内 `test -w /dev/kvm`（系统docker 下为真）。
-- HF 下载：`huggingface.co` 直连不通。**用 `OSWORLD_HF_MIRROR=hf-mirror.com` + clash**。`hf-mirror` 直连需宿主联网（校园网欠费时不通），clash 节点独立、较稳。
+- HF 下载：`huggingface.co` 宿主直连不通（校园网墙）。**用 clash 代理直连 huggingface.co**（clash 节点独立于校园 ipgw，能跟随 LFS/xethub 重定向、大小文件都行）。**不要用 hf-mirror**（大文件失败）。
 - 并行：用 `--workers N --base_urls <N个或更少>`（多进程 spawn，每 worker 独立 VM）。N=10 配 5 个 4B 服务实测可行。
 
 ## STEP 1 — 资产就位（校验）
@@ -73,10 +74,11 @@ for gp in "1 8002" "2 8003" "3 8004" "5 8005" "7 8006"; do set -- $gp
 ```bash
 cd $OSW
 URLS="http://127.0.0.1:8002/v1,http://127.0.0.1:8003/v1,http://127.0.0.1:8004/v1,http://127.0.0.1:8005/v1,http://127.0.0.1:8006/v1"
-nohup env DOCKER_HOST=unix:///var/run/docker.sock OSWORLD_FORCE_KVM=1 OSWORLD_HF_MIRROR=hf-mirror.com \
+nohup env DOCKER_HOST=unix:///var/run/docker.sock OSWORLD_FORCE_KVM=1 \
   http_proxy=$CLASH https_proxy=$CLASH no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1 \
   $PY_OSWORLD holo_repro/run_holo.py --workers 10 --base_urls "$URLS" \
   > $REPO/full_eval.log 2>&1 &
+# 不设 OSWORLD_HF_MIRROR（见 CANONICAL ENV 说明）：HF 经 clash 直连 huggingface.co
 ```
 默认 max_steps=100、全 369、跳过已有 result.txt。
 
@@ -114,7 +116,7 @@ for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do
 
 ## TROUBLESHOOT（症状 → 诊断 → 修）
 - **VM never ready / 卡在 Checking ready**：缺 `/dev/net/tun`（provider 已加）或 KVM 退出。查容器日志 `docker logs <cid>`；确认系统docker + FORCE_KVM。
-- **`huggingface.co ... timed out` 激增**：HF 没走 mirror/clash。确认 `OSWORLD_HF_MIRROR` 与 `http_proxy=clash` 都在 env；`https_proxy=$CLASH curl hf-mirror` 应 200。
+- **`huggingface.co ... timed out` 激增**：HF 没走 clash。确认 `http_proxy=https_proxy=$CLASH` 在 env（评测进程及其 spawn worker 都继承）；`https_proxy=$CLASH curl -sIL -o /dev/null -w '%{http_code}' https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/gimp/045bf3ff-9077-4b86-b483-a1040a949cff/gate.jpeg?download=true` 应 200。**不要改用 hf-mirror**（大文件会失败）。
 - **`ProxyError` 激增**：clash 挂了。`https_proxy=$CLASH curl -I https://hf-mirror.com`；clash 不通则等其恢复或换节点（clash 是用户的）。
 - **`Failed to download` 且 `宿主 bing=000`**：校园网断/欠费（`network_login.sh` 返回 E2616）→ 报告人类充值；保活会自动重登恢复。
 - **崩溃但 HF/Proxy 都 0**：偶发 VM 启动慢/截图空，健壮 agent 已兜（连续 4 次才结束）。少量正常。

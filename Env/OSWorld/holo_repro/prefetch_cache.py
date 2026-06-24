@@ -60,12 +60,16 @@ def main() -> None:
                 if "huggingface.co" not in orig and "hf-mirror" not in orig:
                     continue
                 total_files += 1
-                mir = orig.replace("huggingface.co", MIRROR)
-                keys = {cache_path(tid, orig, vm_path), cache_path(tid, mir, vm_path)}
+                # Canonical runtime = clash proxy + NO mirror, so the cache key uses
+                # the ORIGINAL huggingface.co url (matches setup.py when OSWORLD_HF_MIRROR
+                # is unset). Fetch the original url too — clash reaches huggingface.co and
+                # follows its LFS/xethub redirect for large files (hf-mirror does NOT:
+                # it 302s large files to an unreachable CDN).
+                keys = {cache_path(tid, orig, vm_path)}
                 if all(os.path.exists(k) for k in keys):
                     skipped += 1
                     continue
-                fetch_url = mir if "huggingface.co" in orig else orig
+                fetch_url = orig
                 try:
                     r = requests.get(fetch_url, timeout=90)
                     r.raise_for_status()
