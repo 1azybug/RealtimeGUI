@@ -116,6 +116,11 @@ class SetupController:
         """
         for f in files:
             url: str = f["url"]
+            # huggingface.co is often unreachable behind the campus network; rewrite
+            # to a reachable mirror (e.g. hf-mirror.com) when OSWORLD_HF_MIRROR is set.
+            _mirror = os.environ.get("OSWORLD_HF_MIRROR")
+            if _mirror and "huggingface.co" in url:
+                url = url.replace("huggingface.co", _mirror)
             path: str = f["path"]
             cache_path: str = os.path.join(self.cache_dir, "{:}_{:}".format(
                 uuid.uuid5(uuid.NAMESPACE_URL, url),
@@ -733,6 +738,9 @@ class SetupController:
             elif operation == 'upload':
                 params = config['args'][oid]
                 url = params['url']
+                _mirror = os.environ.get("OSWORLD_HF_MIRROR")
+                if _mirror and "huggingface.co" in url:
+                    url = url.replace("huggingface.co", _mirror)
                 with tempfile.NamedTemporaryFile(mode='wb', delete=False) as tmpf:
                     response = requests.get(url, stream=True)
                     response.raise_for_status()
@@ -813,6 +821,9 @@ class SetupController:
     def _update_browse_history_setup(self, **config):
         cache_path = os.path.join(self.cache_dir, "history_new.sqlite")
         db_url = "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/chrome/44ee5668-ecd5-4366-a6ce-c1c9b8d4e938/history_empty.sqlite?download=true"
+        _mirror = os.environ.get("OSWORLD_HF_MIRROR")
+        if _mirror:
+            db_url = db_url.replace("huggingface.co", _mirror)
         if not os.path.exists(cache_path):
             max_retries = 3
             downloaded = False

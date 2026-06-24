@@ -15,7 +15,10 @@ logger.setLevel(logging.INFO)
 
 WAIT_TIME = 3
 RETRY_INTERVAL = 1
-LOCK_TIMEOUT = 10
+# Port-allocation lock is contended when many parallel workers start their VMs
+# at once; wait patiently instead of failing fast (the lock is only held briefly
+# per worker, during port allocation + container create).
+LOCK_TIMEOUT = 180
 
 
 class PortAllocationError(Exception):

@@ -24,6 +24,7 @@ Official conventions implemented here:
 from __future__ import annotations
 
 import base64
+import logging
 import time
 from io import BytesIO
 from typing import Any, Optional
@@ -33,6 +34,8 @@ from PIL import Image
 
 from computer_env import ComputerEnv, InputEvent
 from holo_agent.tools import TERMINAL_TOOLS, TOOLS, build_schema, make_step_model, parse_step, schema_block
+
+logger = logging.getLogger("holo_agent")
 
 _SYSTEM_PROMPT = """You are an autonomous computer-use agent. You operate a computer the way a human does: you look at a screenshot of the screen and act by clicking with the mouse, typing on the keyboard, and pressing keys.
 
@@ -83,7 +86,7 @@ class HoloComputerAgent:
         temperature: float = 0.8,
         reasoning_effort: str = "medium",
         image_budget: int = 3,
-        max_tokens: int = 2048,
+        max_tokens: int = 3072,
         top_p: float = 0.9,
         on_step: Optional[Any] = None,
     ) -> None:
@@ -176,13 +179,43 @@ class HoloComputerAgent:
         finished_by_agent = False
         final_answer: Optional[str] = None
 
+        # A single transient failure (a truncated/invalid model output, a slow VM
+        # screenshot, a flaky env.step) must NOT crash the whole episode — retry
+        # the step and, only after several consecutive failures, end gracefully so
+        # the runner still scores the task. This robustness is agent-side concern.
+        consecutive_errors = 0
         while not self.env.is_done() and steps < self.max_steps:
-            image = self.env.screenshot()
+            if consecutive_errors >= 4:
+                logger.warning("too many consecutive errors; ending episode early")
+                break
+
+            try:
+                image = self.env.screenshot()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("screenshot failed: %s", e)
+                consecutive_errors += 1
+                time.sleep(2)
+                continue
             messages.append(self._observation_message(image))
             trim_to_last_n_images(messages, self.image_budget)
 
-            content, reasoning = self._call_model(messages)
-            step = parse_step(content, self.step_model)
+            # Model call + structured parse, with retries (handles truncated/invalid JSON).
+            step = reasoning = None
+            for attempt in range(3):
+                try:
+                    content, reasoning = self._call_model(messages)
+                    step = parse_step(content, self.step_model)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("model call/parse failed (attempt %d): %s", attempt + 1, e)
+                    time.sleep(1.5)
+            if step is None:
+                # Drop the dangling observation we just appended and try a fresh step.
+                if messages and messages[-1].get("role") == "user":
+                    messages.pop()
+                consecutive_errors += 1
+                continue
+
             # Re-add ONLY the parsed output (never the reasoning).
             messages.append({"role": "assistant", "content": step.model_dump_json()})
 
@@ -194,9 +227,16 @@ class HoloComputerAgent:
                     self.on_step(steps, image, step, {"done": True}, reasoning)
                 break
 
-            event = self._tool_call_to_event(tc)
-            result = self.env.step(event)
+            try:
+                event = self._tool_call_to_event(tc)
+                result = self.env.step(event)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("env.step failed: %s", e)
+                consecutive_errors += 1
+                time.sleep(1.5)
+                continue
 
+            consecutive_errors = 0
             tool_output = result.info.get("tool_output", "") if isinstance(result.info, dict) else str(result.info)
             messages.append(
                 {
