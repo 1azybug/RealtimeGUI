@@ -13,7 +13,7 @@ PY_OSWORLD  = /mnt/zhaorunsong/anaconda3/envs/osworld/bin/python
 PY_VLLM     = /mnt/zhaorunsong/anaconda3/envs/vllm_Holo/bin/python
 QCOW2       = $OSW/docker_vm_data/Ubuntu.qcow2   # 24460197888 bytes
 DOCKER_IMG  = happysixd/osworld-docker
-CLASH       = http://127.0.0.1:7897
+PROXY       = http://127.0.0.1:7897   # 反向代理（家用主机经反代给本机供网，非校园网）
 # 评测/服务进程必须用绝对路径 python；vllm_Holo 裸 pip 会指向 base(py3.7)，要用 $PY_VLLM -m pip
 ```
 
@@ -21,15 +21,15 @@ CLASH       = http://127.0.0.1:7897
 ```bash
 DOCKER_HOST=unix:///var/run/docker.sock   # 系统 root docker（KVM 必需）
 OSWORLD_FORCE_KVM=1                        # 强制挂 /dev/kvm
-http_proxy=$CLASH  https_proxy=$CLASH      # HF 经 clash 直连 huggingface.co 出网（大小文件都行）
-no_proxy=localhost,127.0.0.1               # vLLM/docker/VM 直连
+http_proxy=$PROXY  https_proxy=$PROXY      # HF 经反代直连 huggingface.co 出网（大小文件都行）
+no_proxy=localhost,127.0.0.1               # vLLM/docker/VM 回环直连
 # 不要设 OSWORLD_HF_MIRROR！hf-mirror 把大文件(LFS)302→不可达的 cas-bridge.xethub.hf.co，大文件全失败。
-# run_holo 的"huggingface→mirror 全局补丁"由 OSWORLD_HF_MIRROR 开关控制，不设即关闭，请求直奔 huggingface.co 经 clash。
+# run_holo 的"huggingface→mirror 全局补丁"由 OSWORLD_HF_MIRROR 开关控制，不设即关闭，请求直奔 huggingface.co 经反代。
 ```
 
 ## 决策点（按现状选）
 - KVM：本机 rootless docker 用不了 KVM → **必须** `DOCKER_HOST=系统docker + OSWORLD_FORCE_KVM=1`。验证：容器内 `test -w /dev/kvm`（系统docker 下为真）。
-- HF 下载：`huggingface.co` 宿主直连不通（校园网墙）。**用 clash 代理直连 huggingface.co**（clash 节点独立于校园 ipgw，能跟随 LFS/xethub 重定向、大小文件都行）。**不要用 hf-mirror**（大文件失败）。
+- HF 下载：`huggingface.co` 宿主直连不通。**经反向代理 `127.0.0.1:7897` 直连 huggingface.co**（反代能跟随 LFS/xethub 重定向、大小文件都行）。**不要用 hf-mirror**（大文件失败）。
 - 并行：用 `--workers N --base_urls <N个或更少>`（多进程 spawn，每 worker 独立 VM）。N=10 配 5 个 4B 服务实测可行。
 
 ## STEP 1 — 资产就位（校验）
@@ -41,20 +41,18 @@ $PY_OSWORLD -c "import desktop_env, computer_env, holo_agent; print('imports ok'
 缺 qcow2：从 NAS `rsync NAS:/data/ruanjunhao/zhaorunsong/repo/xlangai/ubuntu_osworld/Ubuntu.qcow2.zip` 再 unzip 到 `$OSW/docker_vm_data/`。
 缺包：`$PY_OSWORLD -m pip install -e $REPO/Env` 和 `-e $REPO/Agent --no-deps`。
 
-## STEP 2 — 网络
+## STEP 2 — 网络（反向代理，家用主机供网，非校园网）
 ```bash
-bash /mnt/zhaorunsong/lx/clash/network_login.sh   # 期望 {"res":true,...login_ok}；E2616=欠费→报告人类充值
-https_proxy=$CLASH curl -s -o /dev/null -w '%{http_code}\n' --max-time 12 https://hf-mirror.com   # 期望 200/302
+# 校验反代可出网 + 能跟随 HF 的 LFS/xethub 重定向下大文件（期望 200）
+https_proxy=$PROXY curl -sIL -o /dev/null -w '%{http_code}\n' --max-time 15 \
+  "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/gimp/045bf3ff-9077-4b86-b483-a1040a949cff/gate.jpeg?download=true"
 ```
-保活（长跑期间，每 25min 重登）：
-```bash
-nohup bash -c 'while true; do bash /mnt/zhaorunsong/lx/clash/network_login.sh >/dev/null 2>&1; sleep 1500; done' >/dev/null 2>&1 &
-```
+反代是常驻的，无需登录/保活。若返回非 200：检查 `127.0.0.1:7897` 是否在监听、家用主机供网是否正常，报告人类。
 
 ## STEP 3 — 预下载 setup 文件到 cache（推荐，减少运行时联网）
 ```bash
-cd $OSW && https_proxy=$CLASH http_proxy=$CLASH $PY_OSWORLD holo_repro/prefetch_cache.py
-# 期望末行 downloaded/skipped 多、errors 少；少量 gimp 大图可能失败（运行时 clash 兜底）
+cd $OSW && https_proxy=$PROXY http_proxy=$PROXY $PY_OSWORLD holo_repro/prefetch_cache.py
+# 期望末行 downloaded/skipped 多、errors 少；少量 gimp 大图可能失败（运行时经反代兜底）
 ```
 
 ## STEP 4 — 起 5 个 4B vLLM 服务（GPU 1/2/3/5/7 → 8002-8006）
@@ -75,10 +73,10 @@ for gp in "1 8002" "2 8003" "3 8004" "5 8005" "7 8006"; do set -- $gp
 cd $OSW
 URLS="http://127.0.0.1:8002/v1,http://127.0.0.1:8003/v1,http://127.0.0.1:8004/v1,http://127.0.0.1:8005/v1,http://127.0.0.1:8006/v1"
 nohup env DOCKER_HOST=unix:///var/run/docker.sock OSWORLD_FORCE_KVM=1 \
-  http_proxy=$CLASH https_proxy=$CLASH no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1 \
+  http_proxy=$PROXY https_proxy=$PROXY no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1 \
   $PY_OSWORLD holo_repro/run_holo.py --workers 10 --base_urls "$URLS" \
   > $REPO/full_eval.log 2>&1 &
-# 不设 OSWORLD_HF_MIRROR（见 CANONICAL ENV 说明）：HF 经 clash 直连 huggingface.co
+# 不设 OSWORLD_HF_MIRROR（见 CANONICAL ENV 说明）：HF 经反代直连 huggingface.co
 ```
 默认 max_steps=100、全 369、跳过已有 result.txt。
 
@@ -116,9 +114,9 @@ for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do
 
 ## TROUBLESHOOT（症状 → 诊断 → 修）
 - **VM never ready / 卡在 Checking ready**：缺 `/dev/net/tun`（provider 已加）或 KVM 退出。查容器日志 `docker logs <cid>`；确认系统docker + FORCE_KVM。
-- **`huggingface.co ... timed out` 激增**：HF 没走 clash。确认 `http_proxy=https_proxy=$CLASH` 在 env（评测进程及其 spawn worker 都继承）；`https_proxy=$CLASH curl -sIL -o /dev/null -w '%{http_code}' https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/gimp/045bf3ff-9077-4b86-b483-a1040a949cff/gate.jpeg?download=true` 应 200。**不要改用 hf-mirror**（大文件会失败）。
-- **`ProxyError` 激增**：clash 挂了。`https_proxy=$CLASH curl -I https://hf-mirror.com`；clash 不通则等其恢复或换节点（clash 是用户的）。
-- **`Failed to download` 且 `宿主 bing=000`**：校园网断/欠费（`network_login.sh` 返回 E2616）→ 报告人类充值；保活会自动重登恢复。
+- **`huggingface.co ... timed out` 激增**：HF 没走反代。确认 `http_proxy=https_proxy=$PROXY` 在 env（评测进程及其 spawn worker 都继承）；`https_proxy=$PROXY curl -sIL -o /dev/null -w '%{http_code}' https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/gimp/045bf3ff-9077-4b86-b483-a1040a949cff/gate.jpeg?download=true` 应 200。**不要改用 hf-mirror**（大文件会失败）。
+- **`ProxyError` 激增**：反代不通。`https_proxy=$PROXY curl -sIL -o /dev/null -w '%{http_code}' https://huggingface.co`；反代不通则检查 `127.0.0.1:7897` 是否监听、家用主机供网是否正常。
+- **`Failed to download` / 宿主出网失败**：反代（`127.0.0.1:7897`）或家用主机供网断了 → 检查反代进程与供网，报告人类。
 - **崩溃但 HF/Proxy 都 0**：偶发 VM 启动慢/截图空，健壮 agent 已兜（连续 4 次才结束）。少量正常。
 - **docker 端口锁 `could not be acquired`**：并行抢锁。provider `LOCK_TIMEOUT` 已=180、worker 错峰 8s；仍频繁则减 workers。
 - **结果被污染/旧 worker 没杀干净**：见 STEP 7；换配置后 `rm -rf results` 重跑。
@@ -132,4 +130,4 @@ for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do
 - 检查 `max_steps`/`temperature`/工具集是否与官方一致；`write`→`pyautogui.write` 对非 ASCII 不稳。
 
 ## VM 内真实网站任务（chrome 域等）
-运行时需 VM 联网（经宿主 NAT → 校园网）。clash 在宿主回环、VM 够不到，**无法离线**；校园网欠费时这类必失败。chrome 域若已完成可忽略。
+运行时需 VM 能出网。`run_holo.py` 用 `enable_proxy=True` 让 VM 经宿主反代（tinyproxy 桥接到 `127.0.0.1:7897`）访问外网；反代/家用主机供网一断这类任务会失败。chrome 域若已完成可忽略。

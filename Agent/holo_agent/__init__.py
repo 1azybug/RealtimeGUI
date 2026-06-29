@@ -5,12 +5,13 @@ environment. The agent's action vocabulary (the Holo toolbox + structured-output
 schema) is in ``holo_agent.tools``.
 """
 
-from holo_agent.agent import HoloComputerAgent
+from holo_agent.agent import SYSTEM_PROMPTS, HoloComputerAgent
 from holo_agent.recorder import TrajectoryRecorder
 from holo_agent.tools import TOOLS, Step, make_step_model, parse_step
 
 __all__ = [
     "HoloComputerAgent",
+    "SYSTEM_PROMPTS",
     "TrajectoryRecorder",
     "TOOLS",
     "Step",

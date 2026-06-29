@@ -123,6 +123,17 @@ def build_html(task_dir: str) -> str:
             score = float(open(rp).read().strip())
         except ValueError:
             pass
+
+    # Optional sidecar metadata (env-specific, written by the runner). The report
+    # only knows two conventional keys: ``banner`` ({text, level}) and ``facts`` (dict).
+    meta = {}
+    mp = os.path.join(task_dir, "meta.json")
+    if os.path.exists(mp):
+        try:
+            meta = json.load(open(mp, encoding="utf-8")) or {}
+        except (ValueError, OSError):
+            meta = {}
+
     success = score is not None and score >= 0.999
     status_txt = "—" if score is None else ("SUCCESS" if success else "FAIL")
     status_cls = "ok" if success else ("bad" if score is not None else "")
@@ -169,6 +180,17 @@ def build_html(task_dir: str) -> str:
         </div>
       </section>""")
 
+    # Banner (e.g. an INFEASIBLE-task warning) + extra facts, both from meta.json.
+    banner = meta.get("banner") or {}
+    banner_html = ""
+    if isinstance(banner, dict) and banner.get("text"):
+        lvl = banner.get("level", "info")
+        banner_html = f'<div class="banner {_esc(lvl)}">{_esc(banner.get("text"))}</div>'
+    extra_facts = ""
+    if isinstance(meta.get("facts"), dict):
+        for k, v in meta["facts"].items():
+            extra_facts += f'<span>{_esc(k)} <b>{_esc(v)}</b></span>'
+
     sys_block = (
         f'<details class="sysprompt"><summary>system prompt sent to the model'
         f' <span class="hint">(instructions + output schema + task)</span></summary>'
@@ -212,6 +234,11 @@ def build_html(task_dir: str) -> str:
     border:1px solid var(--line); font-weight:700; letter-spacing:.08em; }}
   .status.ok {{ color:var(--ok); border-color:color-mix(in srgb,var(--ok) 45%, var(--line)); }}
   .status.bad {{ color:var(--bad); border-color:color-mix(in srgb,var(--bad) 45%, var(--line)); }}
+  .banner {{ margin-top:18px; padding:12px 16px; border-radius:10px; font-weight:600; font-size:13.5px;
+    border:1px solid var(--line); line-height:1.5; }}
+  .banner.warn {{ color:#ffcaa3; background:color-mix(in srgb,var(--pointer) 14%, transparent);
+    border-color:color-mix(in srgb,var(--pointer) 45%, var(--line)); }}
+  .banner.info {{ color:var(--muted); background:var(--panel); }}
   .status .dot {{ width:8px; height:8px; border-radius:50%; background:currentColor; box-shadow:0 0 12px currentColor; }}
   main {{ max-width:1180px; margin:0 auto; padding:22px 20px 80px; }}
   details.sysprompt,details.reasoning {{ border:1px solid var(--line); border-radius:10px;
@@ -286,7 +313,9 @@ def build_html(task_dir: str) -> str:
         <b style="color:var(--pointer)">mouse</b> /
         <b style="color:var(--keyboard)">keyboard</b> /
         <b style="color:var(--terminal)">terminal</b></span>
+      {extra_facts}
     </div>
+    {banner_html}
   </header>
   <main>
     {sys_block}

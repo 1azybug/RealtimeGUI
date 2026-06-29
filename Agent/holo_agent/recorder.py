@@ -19,6 +19,7 @@ Usage::
 from __future__ import annotations
 
 import datetime
+import glob
 import json
 import os
 from typing import Any
@@ -33,11 +34,35 @@ class TrajectoryRecorder:
         self.out_dir = out_dir
         os.makedirs(out_dir, exist_ok=True)
         self.traj_path = os.path.join(out_dir, "traj.jsonl")
+        # Start a CLEAN recording: a recorder is constructed once per task run, so
+        # any traj/screenshots already in this dir are from an earlier, interrupted
+        # attempt (crash-then-resume, or an orphan worker). Appending would splice
+        # multiple episodes into one traj.jsonl — which polluted ~23% of an earlier
+        # full run and corrupts per-step analysis. Truncate stale artifacts so each
+        # run leaves exactly one clean episode.
+        open(self.traj_path, "w").close()
+        for old in glob.glob(os.path.join(out_dir, "step_*.png")):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
 
     def dump_system_prompt(self, text: str) -> None:
         """Persist the exact system prompt the model was given (for inspection)."""
         with open(os.path.join(self.out_dir, "system_prompt.txt"), "w", encoding="utf-8") as f:
             f.write(text or "")
+
+    def dump_meta(self, meta: dict) -> None:
+        """Persist arbitrary run metadata as ``meta.json``.
+
+        The recorder treats ``meta`` as an opaque dict — it does NOT interpret any
+        key. Runners use it to attach environment-specific facts (e.g. OSWorld's
+        infeasibility tag) for the report and for offline triage; the generic HTML
+        report renders a couple of conventional keys (``banner``, ``facts``) if
+        present. This keeps all environment knowledge out of the Agent package.
+        """
+        with open(os.path.join(self.out_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2, default=str)
 
     def on_step(self, step_idx: int, image: Image.Image, step: Any, info: Any, reasoning: str) -> None:
         """``HoloComputerAgent`` on_step hook: save the observation + one traj line.

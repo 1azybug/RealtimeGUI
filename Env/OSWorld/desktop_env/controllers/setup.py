@@ -311,7 +311,13 @@ class SetupController:
             command = command.split()
             
         if command[0] == "google-chrome" and self.use_proxy:
-            command.append("--proxy-server=http://127.0.0.1:18888")  # Use the proxy server set up by _proxy_setup
+            # Chrome must launch WITH the proxy flag (it overrides gsettings). Upstream
+            # points at the in-VM tinyproxy (127.0.0.1:18888). Our gated geo fix skips
+            # tinyproxy and routes the VM straight at the host relay, so point Chrome
+            # there instead when HOLO_VM_PROXY is set (no-op for upstream users).
+            import os as _os
+            _vp = _os.environ.get("HOLO_VM_PROXY")
+            command.append(f"--proxy-server={_vp}" if _vp else "--proxy-server=http://127.0.0.1:18888")
 
         payload = json.dumps({"command": command, "shell": shell})
         headers = {"Content-Type": "application/json"}
@@ -531,7 +537,41 @@ class SetupController:
             
             if retry == MAX_RETRIES:
                 return False
-            
+
+        # --- Gated geo fix (HOLO_VM_PROXY): no-op for upstream users ----------------
+        # On this box the VM defaults to the campus network (China geo + captive portal);
+        # route its web traffic through HOLO_VM_PROXY instead (the host relay ->
+        # 127.0.0.1:7897 home US VPN proxy, which the VM can reach directly at
+        # 10.200.0.1:7897). Set the GNOME/Chrome system proxy + shell env here, which
+        # runs BEFORE the task's Chrome launches. No tinyproxy/apt needed. When
+        # HOLO_VM_PROXY is unset this whole branch is skipped and behaviour is upstream.
+        import os as _os
+        _vmproxy = _os.environ.get("HOLO_VM_PROXY")
+        if _vmproxy:
+            from urllib.parse import urlparse as _urlparse
+            _u = _urlparse(_vmproxy)
+            _h, _p = _u.hostname, _u.port
+            _cmds = [
+                f"echo 'export http_proxy={_vmproxy}' >> ~/.bashrc",
+                f"echo 'export https_proxy={_vmproxy}' >> ~/.bashrc",
+                f"echo 'export HTTP_PROXY={_vmproxy}' >> ~/.bashrc",
+                f"echo 'export HTTPS_PROXY={_vmproxy}' >> ~/.bashrc",
+                "gsettings set org.gnome.system.proxy mode 'manual'",
+                f"gsettings set org.gnome.system.proxy.http host '{_h}'",
+                f"gsettings set org.gnome.system.proxy.http port {_p}",
+                f"gsettings set org.gnome.system.proxy.https host '{_h}'",
+                f"gsettings set org.gnome.system.proxy.https port {_p}",
+                "gsettings set org.gnome.system.proxy ignore-hosts "
+                "\"['localhost', '127.0.0.0/8', '::1', '20.20.20.0/24', '10.0.0.0/8']\"",
+            ]
+            for _c in _cmds:
+                try:
+                    self._execute_setup([_c], shell=True)
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning(f"HOLO_VM_PROXY setup cmd failed: {_e}")
+            logger.info(f"HOLO_VM_PROXY geo fix: VM proxy -> {_vmproxy}")
+            return
+
         # Get proxy from global proxy pool
         proxy_pool = get_global_proxy_pool()
         current_proxy = proxy_pool.get_next_proxy()
@@ -544,14 +584,14 @@ class SetupController:
         proxy_url = proxy_pool._format_proxy_url(current_proxy)
         logger.info(f"Setting up proxy: {current_proxy.host}:{current_proxy.port}")
         
-        # Configure system proxy environment variables  
+        # Configure system proxy environment variables
         proxy_commands = [
             f"echo '{client_password}' | sudo -S bash -c \"apt-get update\"", ## TODO: remove this line if ami is already updated
             f"echo '{client_password}' | sudo -S bash -c \"apt-get install -y tinyproxy\"", ## TODO: remove this line if tinyproxy is already installed
             f"echo '{client_password}' | sudo -S bash -c \"echo 'Port 18888' > /tmp/tinyproxy.conf\"",
             f"echo '{client_password}' | sudo -S bash -c \"echo 'Allow 127.0.0.1' >> /tmp/tinyproxy.conf\"",
             f"echo '{client_password}' | sudo -S bash -c \"echo 'Upstream http {current_proxy.username}:{current_proxy.password}@{current_proxy.host}:{current_proxy.port}' >> /tmp/tinyproxy.conf\"",
-            
+
             # CML commands to set environment variables for proxy
             f"echo 'export http_proxy={proxy_url}' >> ~/.bashrc",
             f"echo 'export https_proxy={proxy_url}' >> ~/.bashrc",
@@ -567,7 +607,7 @@ class SetupController:
                 logger.error(f"Failed to execute proxy setup command: {e}")
                 proxy_pool.mark_proxy_failed(current_proxy)
                 raise
-        
+
         self._launch_setup(["tinyproxy -c /tmp/tinyproxy.conf -d"], shell=True)
         
         # Reload environment variables
@@ -691,6 +731,18 @@ class SetupController:
                     dest(List[str]): the path in the google drive to store the downloaded file
         """
         settings_file = config.get('settings_file', 'evaluation_examples/settings/googledrive/settings.yml')
+        import httplib2, os as _os
+        _proxy_url = (_os.environ.get('https_proxy') or _os.environ.get('http_proxy') or
+                      _os.environ.get('HTTPS_PROXY') or _os.environ.get('HTTP_PROXY'))
+        if _proxy_url:
+            from urllib.parse import urlparse
+            _p = urlparse(_proxy_url)
+            _orig_init = httplib2.Http.__init__
+            def _proxy_init(self, *a, **kw):
+                if 'proxy_info' not in kw:
+                    kw['proxy_info'] = httplib2.ProxyInfo(httplib2.socks.PROXY_TYPE_HTTP, _p.hostname, _p.port)
+                _orig_init(self, *a, **kw)
+            httplib2.Http.__init__ = _proxy_init
         gauth = GoogleAuth(settings_file=settings_file)
         drive = GoogleDrive(gauth)
 

@@ -114,6 +114,12 @@ class WaitArgs(BaseModel):
     """Wait for the screen to settle / a slow operation to finish."""
 
     tool_name: Literal["wait"]
+    seconds: float = Field(
+        default=3.0,
+        description="How long to wait, in seconds. Use a few seconds for a quick "
+        "settle, or more (e.g. 10-30) while a slow page or operation finishes, so you "
+        "don't waste steps issuing wait repeatedly.",
+    )
 
 
 #: The single, unified Holo computer-use toolbox. No game/desktop split — every

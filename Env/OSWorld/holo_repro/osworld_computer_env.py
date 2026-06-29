@@ -70,6 +70,10 @@ def _map_key(k: str) -> str:
     return _KEYMAP.get(str(k).strip().lower(), str(k).strip().lower())
 
 
+# Upper bound for a single `wait` so a stray huge value can't stall a task.
+_WAIT_MAX_SECONDS = 60.0
+
+
 class OSWorldComputerEnv(ComputerEnv):
     """Wraps a (already-reset) OSWorld ``DesktopEnv`` as a ``ComputerEnv``."""
 
@@ -95,7 +99,18 @@ class OSWorldComputerEnv(ComputerEnv):
 
     def step(self, event: InputEvent) -> StepResult:
         action = self._event_to_action(event)
-        obs, reward, done, info = self.env.step(action, self.pause)
+        # `wait` carries an optional duration. env.step uses its `pause` arg as the WAIT
+        # sleep (desktop_env: `if action == 'WAIT': time.sleep(pause)`), so we pass the
+        # model-requested seconds through as the pause for a wait, clamped for safety, and
+        # the default pause for everything else.
+        pause = self.pause
+        if event.tool_name == "wait":
+            try:
+                pause = float((event.params or {}).get("seconds", self.pause))
+            except (TypeError, ValueError):
+                pause = self.pause
+            pause = max(0.0, min(pause, _WAIT_MAX_SECONDS))
+        obs, reward, done, info = self.env.step(action, pause)
         self._obs = obs
         self._done = bool(done)
         if action not in ("WAIT", "DONE", "FAIL"):

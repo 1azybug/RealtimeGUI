@@ -6,3 +6,6 @@ save_credentials_backend: file
 save_credentials_file: evaluation_examples/settings/googledrive/credentials.json
 
 get_refresh_token: True
+
+oauth_scope:
+  - https://www.googleapis.com/auth/drive

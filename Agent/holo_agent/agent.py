@@ -37,7 +37,8 @@ from holo_agent.tools import TERMINAL_TOOLS, TOOLS, build_schema, make_step_mode
 
 logger = logging.getLogger("holo_agent")
 
-_SYSTEM_PROMPT = """You are an autonomous computer-use agent. You operate a computer the way a human does: you look at a screenshot of the screen and act by clicking with the mouse, typing on the keyboard, and pressing keys.
+# --- Baseline prompt (v1): the original minimal prompt, kept for A/B comparison. ---
+_SYSTEM_PROMPT_BASELINE = """You are an autonomous computer-use agent. You operate a computer the way a human does: you look at a screenshot of the screen and act by clicking with the mouse, typing on the keyboard, and pressing keys.
 
 Each step you receive the current screenshot inside an <observation> block. Decide the single best next action to make progress on the user's task, then respond with exactly ONE JSON object matching the schema below.
 
@@ -49,6 +50,35 @@ Guidelines:
 - When the task is fully complete (or if it is genuinely impossible), call `answer` with your final answer or a short summary.
 
 {schema_block}"""
+
+
+# --- v2 prompt: adds behavioral rules targeting observed failure modes (under-saving,
+# premature "done"/no self-check, imprecision, flailing, under-declaring infeasible).
+# Stays environment-agnostic — no OSWorld/game knowledge. This is the default. ---
+_SYSTEM_PROMPT = """You are an autonomous computer-use agent. You operate a computer the way a human does: you look at a screenshot of the screen and act by moving and clicking the mouse, typing on the keyboard, and pressing keys.
+
+Each step you receive the current screenshot inside an <observation> block. Decide the single best next action to make progress on the user's task, then respond with exactly ONE JSON object matching the schema below.
+
+How to act:
+- Look carefully at the screenshot. On-screen labels, menus, controls and text tell you what is available and what each control does — infer the interface from what you actually see, not from assumptions.
+- Coordinates are integers in [0, 1000], normalized to the screenshot (origin top-left). Aim at the center of the target element.
+- Take exactly one action per step, chosen from the tools in the schema below.
+- Put anything you must remember for later (values, IDs, file paths, what you have already done) in the `note` field; your private reasoning is NOT carried forward.
+
+Completing the task correctly:
+- Follow the request precisely. Match every explicit detail — exact names, paths, locations, values and formatting — and do not change anything the task did not ask you to change.
+- After each action, check the new screenshot to confirm it had the intended effect. If it did not work or a value was not entered, fix it before moving on; never assume success.
+- Persist your work. If you edited a document, file or settings, save it (e.g. Ctrl+S, or confirm the dialog) so the change is written to disk — an unsaved change does not count as done.
+- If an approach is not working after a couple of attempts, stop repeating it and try a different path (a menu, a keyboard shortcut, a different control).
+
+Finishing:
+- When the task is fully complete and you have verified the result on screen, call `answer` with a short summary.
+- If the task is genuinely impossible (the required option does not exist, the request is contradictory, or it cannot be done in this environment), call `answer` and state clearly that it is infeasible instead of pretending it is done — but only after you have actually tried.
+
+{schema_block}"""
+
+# Registry so runners can select a variant by name (e.g. for A/B experiments).
+SYSTEM_PROMPTS = {"v1": _SYSTEM_PROMPT_BASELINE, "v2": _SYSTEM_PROMPT}
 
 
 def _image_to_data_url(image: Image.Image) -> str:
@@ -89,6 +119,7 @@ class HoloComputerAgent:
         max_tokens: int = 3072,
         top_p: float = 0.9,
         on_step: Optional[Any] = None,
+        system_prompt_template: Optional[str] = None,
     ) -> None:
         self.client = client
         self.model = model
@@ -99,6 +130,9 @@ class HoloComputerAgent:
         self.image_budget = image_budget
         self.max_tokens = max_tokens
         self.top_p = top_p
+        # System prompt template (must contain a ``{schema_block}`` placeholder).
+        # Defaults to the current best prompt; override for A/B experiments.
+        self._system_prompt_template = system_prompt_template or _SYSTEM_PROMPT
         # Optional callback(step_index, screenshot, step_obj, info_dict, reasoning).
         self.on_step = on_step
         # The agent owns its action vocabulary — a single fixed Holo toolbox.
@@ -106,7 +140,7 @@ class HoloComputerAgent:
         self.schema = build_schema(self.step_model)
 
     def _system_message(self) -> dict[str, Any]:
-        content = _SYSTEM_PROMPT.format(schema_block=schema_block(self.step_model))
+        content = self._system_prompt_template.format(schema_block=schema_block(self.step_model))
         content += f"\n\n<task>\n{self.env.task}\n</task>"
         return {"role": "system", "content": content}
 
@@ -144,7 +178,15 @@ class HoloComputerAgent:
                     },
                 )
                 msg = resp.choices[0].message
-                return (msg.content or ""), (getattr(msg, "reasoning_content", None) or "")
+                # vLLM with --reasoning-parser qwen3 returns thinking in msg.reasoning
+                # (stored as model_extra); fall back to reasoning_content for other backends.
+                reasoning = (
+                    getattr(msg, "reasoning", None)
+                    or (msg.model_extra or {}).get("reasoning", "")
+                    or getattr(msg, "reasoning_content", None)
+                    or ""
+                )
+                return (msg.content or ""), reasoning
             except Exception as e:  # noqa: BLE001
                 last_err = e
                 time.sleep(2.0 * (attempt + 1))

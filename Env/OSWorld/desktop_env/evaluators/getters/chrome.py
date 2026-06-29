@@ -34,8 +34,61 @@ _accessibility_ns_map = {
 
 logger = logging.getLogger("desktopenv.getters.chrome")
 
+
+# --- Robust page-wait helpers (slow-proxy hardening) ---------------------------------
+# WHY THIS EXISTS — read 复现_debug_评测器修复.md before "simplifying" this away.
+# Several getters drive Chrome with Playwright `wait_until='networkidle'` (load + 500ms
+# of zero network). On a fast direct link that settles in ~seconds. But this box reaches
+# the internet only through a high-latency reverse-proxy, and many real pages (blogs with
+# analytics / comment widgets, etc.) keep issuing background requests, so 'networkidle'
+# NEVER settles — measured: it timed out even at 180s. The original code then threw,
+# exhausted its retries, and returned EMPTY/garbage reference data, which silently scores
+# a CORRECT model run as 0. That is an evaluator-infra false-negative, not a model failure.
+#
+# These helpers degrade gracefully: try 'networkidle' briefly (so fast links keep the
+# strictest, fullest wait — behaviour UNCHANGED there), then fall back to 'load' (the real
+# "all resources fetched" signal, given the long budget), then 'domcontentloaded'. We do
+# NOT relax WHAT is checked or change any pass/fail threshold — only HOW long / which load
+# state we wait for so the reference is actually produced. On a normal network the first
+# attempt wins and nothing changes.
+_WAIT_PLAN = (("networkidle", 30000), ("load", 180000), ("domcontentloaded", 60000))
+
+
+def _goto_with_fallback(page, url: str, logtag: str = "NAV") -> None:
+    """Navigate to ``url`` and wait for load, degrading networkidle -> load ->
+    domcontentloaded so a non-idling page over the proxy still loads. Raises the last
+    error only if EVERY strategy fails."""
+    last_err = None
+    for _wait, _to in _WAIT_PLAN:
+        try:
+            page.goto(url, wait_until=_wait, timeout=_to)
+            page.wait_for_load_state(_wait, timeout=_to)
+            if _wait != "networkidle":
+                logger.warning(f"[{logtag}] networkidle unreachable; used wait_until='{_wait}'")
+            return
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            logger.warning(f"[{logtag}] wait_until='{_wait}' (timeout {_to}ms) failed: {e}")
+    raise last_err
+
+
+def _wait_load_with_fallback(page, logtag: str = "WAIT") -> None:
+    """Wait for an already-navigated page to settle, degrading networkidle -> load ->
+    domcontentloaded. Best-effort: if all fail, log and return (caller proceeds with
+    whatever is loaded) rather than aborting the whole getter."""
+    for _wait, _to in _WAIT_PLAN:
+        try:
+            page.wait_for_load_state(_wait, timeout=_to)
+            if _wait != "networkidle":
+                logger.warning(f"[{logtag}] networkidle unreachable; used '{_wait}'")
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{logtag}] wait_for_load_state('{_wait}') failed: {e}")
+    logger.warning(f"[{logtag}] all load-state waits failed; proceeding with current DOM")
+
+
 """
-WARNING: 
+WARNING:
 1. Functions from this script assume that no account is registered on Chrome, otherwise the default file path needs to be changed.
 2. The functions are not tested on Windows and Mac, but they should work.
 """
@@ -846,11 +899,11 @@ def get_page_info(env, config: Dict[str, str]):
                 page.set_default_timeout(timeout_ms)
 
                 logger.info(f"[PAGE_INFO] Navigating to URL: {target_url}")
-                page.goto(target_url, wait_until="networkidle", timeout=timeout_ms)
+                _goto_with_fallback(page, target_url, "PAGE_INFO")
 
                 try:
                     # Wait for the page to finish loading to avoid "execution context was destroyed"
-                    page.wait_for_load_state("networkidle", timeout=timeout_ms)
+                    _wait_load_with_fallback(page, "PAGE_INFO")
                     title = page.title()
                     final_url = page.url
                     page_info = {"title": title, "url": final_url, "content": page.content()}
@@ -946,7 +999,7 @@ def get_open_tabs_info(env, config: Dict[str, str]):
                             page.set_default_timeout(timeout_ms)
                             
                             # Wait for the page to finish loading, this prevents the "execution context was destroyed" issue
-                            page.wait_for_load_state('networkidle', timeout=timeout_ms)  # Wait for the 'load' event to complete
+                            _wait_load_with_fallback(page, "OPEN_TABS_INFO")  # networkidle->load->domcontentloaded
                             title = page.title()
                             url = page.url
                             tabs_info.append({'title': title, 'url': url})
@@ -1223,12 +1276,12 @@ def get_pdf_from_url(env, config: Dict[str, str]) -> str:
                 page.set_default_timeout(timeout_ms)
                 
                 logger.info(f"[PDF_FROM_URL] Navigating to URL: {_url}")
-                page.goto(_url, wait_until='networkidle', timeout=timeout_ms)
-                
-                # Wait for page to be fully loaded
-                logger.info(f"[PDF_FROM_URL] Waiting for page to be fully loaded...")
-                page.wait_for_load_state('networkidle', timeout=timeout_ms)
-                
+                # Degrade networkidle -> load -> domcontentloaded (see _goto_with_fallback).
+                # The gold PDF must reflect the FULLY-loaded page; over the proxy 'load' is
+                # the workhorse since 'networkidle' may never settle. If every strategy fails
+                # the helper re-raises and the outer retry/empty-PDF fallback takes over.
+                _goto_with_fallback(page, _url, "PDF_FROM_URL")
+
                 # Additional wait to ensure all content is rendered
                 time.sleep(3)
                 
@@ -1326,10 +1379,9 @@ def get_chrome_saved_address(env, config: Dict[str, str]):
 
                 # Navigate to Chrome's settings page for autofill
                 logger.info(f"[CHROME_SAVED_ADDRESS] Navigating to Chrome settings page")
-                page.goto("chrome://settings/addresses", wait_until='networkidle', timeout=timeout_ms)
-                
-                # Wait for page to be fully loaded
-                page.wait_for_load_state('networkidle', timeout=timeout_ms)
+                # chrome:// is a local page (networkidle settles instantly); use the same
+                # helper for consistency so no getter is left on a bare networkidle wait.
+                _goto_with_fallback(page, "chrome://settings/addresses", "CHROME_SAVED_ADDRESS")
 
                 # Get the HTML content of the page
                 content = page.content()
@@ -1437,10 +1489,7 @@ def get_number_of_search_results(env, config: Dict[str, str]):
                 page.set_default_timeout(timeout_ms)
                 
                 logger.info(f"[SEARCH_RESULTS] Navigating to URL: {url}")
-                page.goto(url, wait_until='networkidle', timeout=timeout_ms)
-                
-                # Wait for page to be fully loaded
-                page.wait_for_load_state('networkidle', timeout=timeout_ms)
+                _goto_with_fallback(page, url, "SEARCH_RESULTS")
                 
                 search_results = page.query_selector_all(result_selector)
                 actual_count = len(search_results)
@@ -1850,7 +1899,7 @@ def get_active_tab_html_parse(env, config: Dict[str, Any]):
             for page in context.pages:
                 try:
                     # Wait for page to be stable before checking URL
-                    page.wait_for_load_state("networkidle", timeout=60000)
+                    _wait_load_with_fallback(page, "RECREATION")
                     
                     # Check if page is still valid before accessing properties
                     if page.is_closed():
@@ -2364,8 +2413,8 @@ def get_gotoRecreationPage_and_get_html_content(env, config: Dict[str, Any]):
                     
                 # Additional wait to ensure page is fully loaded
                 try:
-                    page.wait_for_load_state('networkidle', timeout=30000)
-                    logger.info(f"[RECREATION_PAGE] Page fully loaded and idle")
+                    _wait_load_with_fallback(page, "RECREATION_PAGE")
+                    logger.info(f"[RECREATION_PAGE] Page fully loaded")
                 except Exception as e:
                     logger.warning(f"[RECREATION_PAGE] NetworkIdle wait failed, continuing: {e}")
 
